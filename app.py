@@ -16,12 +16,17 @@ load_dotenv()
 app = Flask(__name__)
 
 # Configure CORS
+allowed_origins = [
+    os.getenv('FRONTEND_URL', 'https://your-frontend-url.onrender.com'),
+    os.getenv('FRONTEND_URL_ALT', ''),
+    'http://localhost:3000',
+    'http://localhost:5000'
+]
+allowed_origins = [o for o in allowed_origins if o]
+
 CORS(app, resources={
     r"/api/*": {
-        "origins": [
-            os.getenv('FRONTEND_URL', 'https://your-frontend-url.onrender.com'),
-            'http://localhost:3000'  # For local development
-        ],
+        "origins": allowed_origins or "*",
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
