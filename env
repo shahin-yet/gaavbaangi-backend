@@ -1,7 +1,6 @@
 # Copy this file to .env and fill in the values
 
 # Frontend URL (GitHub Pages) allowed by CORS
-FRONTEND_URL=https:https://shahin-yet.github.io/gaavbaangi-frontend/
- 
+FRONTEND_URL=https://shahin-yet.github.io/gaavbaangi-frontend/
 
 
