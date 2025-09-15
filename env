@@ -1,0 +1,7 @@
+# Copy this file to .env and fill in the values
+
+# Frontend URL (GitHub Pages) allowed by CORS
+FRONTEND_URL=https://yourusername.github.io/gaavbaangiconservation_project
+ 
+
+
