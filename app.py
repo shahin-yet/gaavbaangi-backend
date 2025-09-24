@@ -1,7 +1,11 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # optional in PA WSGI shim
+except Exception:
+    def load_dotenv(*_args, **_kwargs):
+        return False
 from urllib.parse import urlsplit
 import logging
 import json
@@ -32,10 +36,15 @@ def _extract_origin(url_value: str | None) -> str | None:
 
 frontend_origin = _extract_origin(os.getenv('FRONTEND_URL'))
 
+if frontend_origin:
+    cors_origins = frontend_origin
+else:
+    # Fallback for initial bring-up; allows any origin to reach API
+    cors_origins = "*"
+
 CORS(app, resources={
     r"/api/*": {
-        # If not set, no cross-site origins are allowed
-        "origins": frontend_origin or [],
+        "origins": cors_origins,
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
