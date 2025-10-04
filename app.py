@@ -1,23 +1,74 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-try:
-    from dotenv import load_dotenv  # optional in PA WSGI shim
-except Exception:
-    def load_dotenv(*_args, **_kwargs):
-        return False
-from urllib.parse import urlsplit
+import sys
 import logging
 import json
+from urllib.parse import urlsplit
 from typing import List, Dict, Any
- 
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Custom dotenv loader with better error handling
+def safe_load_dotenv():
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    try:
+        # Try to load using python-dotenv if available
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            logger.info("Loaded environment from .env using dotenv package")
+            return True
+        except ImportError:
+            logger.info("python-dotenv not installed, using manual method")
+            
+        # Manual fallback - read .env file directly
+        if os.path.exists(env_path):
+            try:
+                # Try UTF-8 first
+                with open(env_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            os.environ[key.strip()] = value.strip()
+                logger.info("Manually loaded environment from .env using UTF-8")
+                return True
+            except UnicodeDecodeError:
+                # Try other encodings
+                for encoding in ['latin1', 'utf-16', 'utf-16-le', 'utf-16-be']:
+                    try:
+                        with open(env_path, 'r', encoding=encoding) as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith('#'):
+                                    continue
+                                if '=' in line:
+                                    key, value = line.split('=', 1)
+                                    os.environ[key.strip()] = value.strip()
+                        logger.info(f"Manually loaded environment from .env using {encoding}")
+                        return True
+                    except:
+                        continue
+                
+                # If all encodings fail, manually set environment variables
+                logger.warning("Failed to read .env file with various encodings. Setting defaults.")
+    except Exception as e:
+        logger.error(f"Error loading environment variables: {str(e)}")
+    
+    # Hard-coded fallback for crucial variables
+    if 'FRONTEND_URL' not in os.environ:
+        os.environ['FRONTEND_URL'] = 'https://shahin-yet.github.io/gaavbaangi-frontend'
+        logger.info("Set FRONTEND_URL from default value")
+    
+    return False
+
 # Load environment variables
-load_dotenv()
+safe_load_dotenv()
 
 app = Flask(__name__)
 
@@ -35,12 +86,14 @@ def _extract_origin(url_value: str | None) -> str | None:
         return url_value.rstrip('/')
 
 frontend_origin = _extract_origin(os.getenv('FRONTEND_URL'))
+logger.info(f"Frontend origin set to: {frontend_origin}")
 
 if frontend_origin:
     cors_origins = frontend_origin
 else:
     # Fallback for initial bring-up; allows any origin to reach API
     cors_origins = "*"
+    logger.warning("No FRONTEND_URL found, CORS set to allow any origin")
 
 CORS(app, resources={
     r"/api/*": {
@@ -50,11 +103,16 @@ CORS(app, resources={
     }
 })
 
- 
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy"})
+    return jsonify({
+        "status": "healthy",
+        "env": {
+            "frontend_url": os.getenv('FRONTEND_URL'),
+            "cors_origin": cors_origins
+        }
+    })
 
 @app.route('/api/init-data', methods=['POST'])
 def init_data():
@@ -144,5 +202,3 @@ def not_found(error):
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({"status": "error", "message": "Internal server error"}), 500
-
- 
