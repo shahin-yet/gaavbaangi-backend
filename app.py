@@ -132,7 +132,8 @@ def init_data():
 # -----------------------------
 # Refuge persistence utilities
 # -----------------------------
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+# Allow overriding data directory via environment for persistent disks
+DATA_DIR = os.getenv('DATA_DIR') or os.path.join(os.path.dirname(__file__), 'data')
 REFUGES_FILE = os.path.join(DATA_DIR, 'refuges.json')
 
 def _ensure_data_file():
@@ -155,12 +156,24 @@ def _read_refuges() -> List[Dict[str, Any]]:
         return []
 
 def _write_refuges(refuges: List[Dict[str, Any]]):
+    """Write refuges atomically to avoid corruption across restarts.
+    Writes to a temporary file in the same directory and then replaces.
+    """
     _ensure_data_file()
+    tmp_path = REFUGES_FILE + '.tmp'
     try:
-        with open(REFUGES_FILE, 'w', encoding='utf-8') as f:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump({"refuges": refuges}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, REFUGES_FILE)
     except Exception as e:
         logger.error(f"Failed to write refuges: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 @app.route('/api/refuges', methods=['GET'])
