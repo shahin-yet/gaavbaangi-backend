@@ -6,6 +6,9 @@ import logging
 import json
 from urllib.parse import urlsplit
 from typing import List, Dict, Any
+from shapely.geometry import shape as shapely_shape, mapping as shapely_mapping
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -196,10 +199,56 @@ def create_refuge():
             return jsonify({"status": "error", "message": "Invalid polygon"}), 400
 
         refuges = _read_refuges()
+        # Name validation (required and unique, case-insensitive)
+        incoming_name = (payload.get('name') or '').strip()
+        if not incoming_name:
+            return jsonify({"status": "error", "message": "Name is required"}), 400
+        lower_incoming = incoming_name.lower()
+        if any(isinstance(r.get('name'), str) and r.get('name', '').strip().lower() == lower_incoming for r in refuges):
+            return jsonify({"status": "error", "message": "A refuge with this name already exists"}), 409
+
+        # Build new geometry and subtract overlaps with existing refuges
+        try:
+            new_geom: BaseGeometry = shapely_shape(polygon)
+        except Exception:
+            return jsonify({"status": "error", "message": "Invalid polygon coordinates"}), 400
+
+        # Collect existing geometries (support Polygon and MultiPolygon already saved)
+        existing_geoms: List[BaseGeometry] = []
+        for r in refuges:
+            try:
+                g = r.get('polygon')
+                if g and isinstance(g, dict) and g.get('type') in ("Polygon", "MultiPolygon"):
+                    existing_geoms.append(shapely_shape(g))
+            except Exception:
+                continue
+
+        # Subtract overlaps from the new geometry
+        try:
+            if existing_geoms:
+                existing_union = unary_union(existing_geoms)
+                result_geom = new_geom.difference(existing_union)
+            else:
+                result_geom = new_geom
+        except Exception:
+            return jsonify({"status": "error", "message": "Failed to process geometry"}), 400
+
+        # Ensure the result has area and is of polygonal type
+        if result_geom.is_empty or result_geom.area <= 0:
+            return jsonify({"status": "error", "message": "Refuge overlaps existing areas completely; nothing to save"}), 400
+        if result_geom.geom_type not in ("Polygon", "MultiPolygon"):
+            return jsonify({"status": "error", "message": "Resulting geometry is not a polygon"}), 400
+
+        # Convert back to GeoJSON geometry
+        result_geojson = shapely_mapping(result_geom)
+
         new_refuge = {
             "id": (refuges[-1]['id'] + 1) if refuges and isinstance(refuges[-1].get('id'), int) else 1,
-            "name": payload.get('name') or f"Refuge #{len(refuges) + 1}",
-            "polygon": polygon
+            "name": incoming_name,
+            "polygon": {
+                "type": result_geojson.get("type"),
+                "coordinates": result_geojson.get("coordinates")
+            }
         }
         refuges.append(new_refuge)
         _write_refuges(refuges)
