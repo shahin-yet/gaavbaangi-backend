@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from typing import List, Dict, Any
 from shapely.geometry import shape as shapely_shape, mapping as shapely_mapping
 from shapely.geometry.base import BaseGeometry
+from shapely.geometry import Polygon as ShpPolygon, MultiPolygon as ShpMultiPolygon
 from shapely.ops import unary_union
 
 # Configure logging
@@ -213,13 +214,61 @@ def create_refuge():
         except Exception:
             return jsonify({"status": "error", "message": "Invalid polygon coordinates"}), 400
 
+        # Make geometry valid (fix self-intersections) and keep only polygonal parts
+        def _make_valid_polygonal(geom: BaseGeometry) -> BaseGeometry:
+            g = geom
+            try:
+                # Prefer shapely.make_valid if available; fallback to buffer(0)
+                try:
+                    from shapely import make_valid as _make_valid  # Shapely >=2
+                except Exception:
+                    try:
+                        from shapely.validation import make_valid as _make_valid  # older
+                    except Exception:
+                        _make_valid = None
+                if not g.is_valid:
+                    g = _make_valid(g) if _make_valid else g.buffer(0)
+            except Exception:
+                try:
+                    g = g.buffer(0)
+                except Exception:
+                    pass
+
+            # Extract only polygonal components if we got a GeometryCollection
+            try:
+                if g.geom_type in ("Polygon", "MultiPolygon"):
+                    return g
+                if hasattr(g, 'geoms'):
+                    polygon_parts = []
+                    for part in g.geoms:
+                        if part.geom_type in ("Polygon", "MultiPolygon"):
+                            polygon_parts.append(part)
+                    if polygon_parts:
+                        try:
+                            return unary_union(polygon_parts)
+                        except Exception:
+                            # Last resort: flatten to MultiPolygon
+                            flat = []
+                            for p in polygon_parts:
+                                if p.geom_type == "Polygon":
+                                    flat.append(p)
+                                elif p.geom_type == "MultiPolygon":
+                                    flat.extend(list(p.geoms))
+                            if flat:
+                                return ShpMultiPolygon(flat)
+                return g
+            except Exception:
+                return g
+
+        new_geom = _make_valid_polygonal(new_geom)
+
         # Collect existing geometries (support Polygon and MultiPolygon already saved)
         existing_geoms: List[BaseGeometry] = []
         for r in refuges:
             try:
                 g = r.get('polygon')
                 if g and isinstance(g, dict) and g.get('type') in ("Polygon", "MultiPolygon"):
-                    existing_geoms.append(shapely_shape(g))
+                    existing_geoms.append(_make_valid_polygonal(shapely_shape(g)))
             except Exception:
                 continue
 
@@ -236,8 +285,11 @@ def create_refuge():
         # Ensure the result has area and is of polygonal type
         if result_geom.is_empty or result_geom.area <= 0:
             return jsonify({"status": "error", "message": "Refuge overlaps existing areas completely; nothing to save"}), 400
+        # If geometry collection slipped through, keep only polygonal parts
         if result_geom.geom_type not in ("Polygon", "MultiPolygon"):
-            return jsonify({"status": "error", "message": "Resulting geometry is not a polygon"}), 400
+            result_geom = _make_valid_polygonal(result_geom)
+            if result_geom.is_empty or result_geom.geom_type not in ("Polygon", "MultiPolygon"):
+                return jsonify({"status": "error", "message": "Resulting geometry is not a polygon"}), 400
 
         # Convert back to GeoJSON geometry
         result_geojson = shapely_mapping(result_geom)
