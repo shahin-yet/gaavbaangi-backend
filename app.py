@@ -178,6 +178,43 @@ def _write_refuges(refuges: List[Dict[str, Any]]):
                 os.remove(tmp_path)
         except Exception:
             pass
+def _safe_unary_union(geoms: List[BaseGeometry]) -> BaseGeometry:
+    try:
+        return unary_union([g for g in geoms if g and not g.is_empty])
+    except Exception:
+        try:
+            # Attempt to validify components and union again
+            fixed = []
+            for g in geoms:
+                if not g or g.is_empty:
+                    continue
+                try:
+                    gg = g if g.is_valid else g.buffer(0)
+                    fixed.append(gg)
+                except Exception:
+                    continue
+            return unary_union(fixed) if fixed else ShpMultiPolygon([])
+        except Exception:
+            # Last resort: pick the first geometry
+            return geoms[0] if geoms else ShpMultiPolygon([])
+
+def _safe_difference(a: BaseGeometry, b: BaseGeometry) -> BaseGeometry:
+    try:
+        return a.difference(b)
+    except Exception:
+        try:
+            aa = a if a.is_valid else a.buffer(0)
+            bb = b if b.is_valid else b.buffer(0)
+            return aa.difference(bb)
+        except Exception:
+            # Optional overlay fallback on Shapely 2
+            try:
+                from shapely import overlay
+                return overlay(a, b, how='difference')
+            except Exception:
+                # Give up and return original to allow subsequent checks to fail gracefully
+                return a
+
 
 
 @app.route('/api/refuges', methods=['GET'])
@@ -275,8 +312,8 @@ def create_refuge():
         # Subtract overlaps from the new geometry
         try:
             if existing_geoms:
-                existing_union = unary_union(existing_geoms)
-                result_geom = new_geom.difference(existing_union)
+                existing_union = _safe_unary_union(existing_geoms)
+                result_geom = _safe_difference(new_geom, existing_union)
             else:
                 result_geom = new_geom
         except Exception:
