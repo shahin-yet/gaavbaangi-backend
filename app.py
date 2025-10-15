@@ -311,11 +311,27 @@ def create_refuge():
 
         # Subtract overlaps from the new geometry
         try:
+            # Start from original geometry
+            result_geom = new_geom
             if existing_geoms:
-                existing_union = _safe_unary_union(existing_geoms)
-                result_geom = _safe_difference(new_geom, existing_union)
-            else:
-                result_geom = new_geom
+                # First, try a fast union-based subtraction
+                try:
+                    existing_union = _safe_unary_union(existing_geoms)
+                    result_geom = _safe_difference(result_geom, existing_union)
+                except Exception:
+                    # If union fails for any reason, continue with sequential subtraction below
+                    pass
+
+                # Robust fallback: sequentially subtract each existing geometry as well.
+                # This ensures that if the union step above partially failed, all overlaps
+                # are still removed.
+                for eg in existing_geoms:
+                    try:
+                        if not result_geom.is_empty:
+                            result_geom = _safe_difference(result_geom, eg)
+                    except Exception:
+                        # _safe_difference already has internal fallbacks; call again to be safe
+                        result_geom = _safe_difference(result_geom, eg)
         except Exception:
             return jsonify({"status": "error", "message": "Failed to process geometry"}), 400
 
