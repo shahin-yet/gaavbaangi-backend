@@ -102,7 +102,7 @@ else:
 CORS(app, resources={
     r"/api/*": {
         "origins": cors_origins,
-        "methods": ["GET", "POST", "OPTIONS"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
 })
@@ -361,6 +361,62 @@ def create_refuge():
     except Exception as e:
         logger.error(f"Error creating refuge: {e}")
         return jsonify({"status": "error", "message": "Failed to create refuge"}), 500
+
+
+@app.route('/api/refuges/<int:refuge_id>', methods=['PUT'])
+def update_refuge(refuge_id: int):
+    """Update an existing refuge's name. Only name updates are supported for now."""
+    try:
+        payload = request.get_json(force=True) or {}
+        new_name = (payload.get('name') or '').strip()
+        if not new_name:
+            return jsonify({"status": "error", "message": "Name is required"}), 400
+
+        refuges = _read_refuges()
+        # Find target refuge
+        target = None
+        for r in refuges:
+            if isinstance(r.get('id'), int) and r.get('id') == refuge_id:
+                target = r
+                break
+        if not target:
+            return jsonify({"status": "error", "message": "Refuge not found"}), 404
+
+        # Ensure unique name (case-insensitive) across other refuges
+        lower_name = new_name.lower()
+        for r in refuges:
+            if r is target:
+                continue
+            if isinstance(r.get('name'), str) and r.get('name', '').strip().lower() == lower_name:
+                return jsonify({"status": "error", "message": "A refuge with this name already exists"}), 409
+
+        target['name'] = new_name
+        _write_refuges(refuges)
+        return jsonify({"status": "success", "refuge": target})
+    except Exception as e:
+        logger.error(f"Error updating refuge: {e}")
+        return jsonify({"status": "error", "message": "Failed to update refuge"}), 500
+
+
+@app.route('/api/refuges/<int:refuge_id>', methods=['DELETE'])
+def delete_refuge(refuge_id: int):
+    """Delete a refuge by id."""
+    try:
+        refuges = _read_refuges()
+        idx = None
+        for i, r in enumerate(refuges):
+            if isinstance(r.get('id'), int) and r.get('id') == refuge_id:
+                idx = i
+                break
+        if idx is None:
+            return jsonify({"status": "error", "message": "Refuge not found"}), 404
+
+        removed = refuges.pop(idx)
+        _write_refuges(refuges)
+        return jsonify({"status": "success", "deleted": removed})
+    except Exception as e:
+        logger.error(f"Error deleting refuge: {e}")
+        return jsonify({"status": "error", "message": "Failed to delete refuge"}), 500
 
 @app.errorhandler(404)
 def not_found(error):
