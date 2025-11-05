@@ -365,12 +365,13 @@ def create_refuge():
 
 @app.route('/api/refuges/<int:refuge_id>', methods=['PUT'])
 def update_refuge(refuge_id: int):
-    """Update an existing refuge's name. Only name updates are supported for now."""
+    """Update an existing refuge's fields. Supports name and/or polygon."""
     try:
         payload = request.get_json(force=True) or {}
-        new_name = (payload.get('name') or '').strip()
-        if not new_name:
-            return jsonify({"status": "error", "message": "Name is required"}), 400
+        new_name = (payload.get('name') or '').strip() if 'name' in payload else None
+        new_polygon = payload.get('polygon') if 'polygon' in payload else None
+        if new_name is None and new_polygon is None:
+            return jsonify({"status": "error", "message": "No updatable fields provided"}), 400
 
         refuges = _read_refuges()
         # Find target refuge
@@ -382,15 +383,54 @@ def update_refuge(refuge_id: int):
         if not target:
             return jsonify({"status": "error", "message": "Refuge not found"}), 404
 
-        # Ensure unique name (case-insensitive) across other refuges
-        lower_name = new_name.lower()
-        for r in refuges:
-            if r is target:
-                continue
-            if isinstance(r.get('name'), str) and r.get('name', '').strip().lower() == lower_name:
-                return jsonify({"status": "error", "message": "A refuge with this name already exists"}), 409
+        # Update name if provided
+        if new_name is not None:
+            # Ensure unique name (case-insensitive) across other refuges
+            if not new_name:
+                return jsonify({"status": "error", "message": "Name is required"}), 400
+            lower_name = new_name.lower()
+            for r in refuges:
+                if r is target:
+                    continue
+                if isinstance(r.get('name'), str) and r.get('name', '').strip().lower() == lower_name:
+                    return jsonify({"status": "error", "message": "A refuge with this name already exists"}), 409
+            target['name'] = new_name
 
-        target['name'] = new_name
+        # Update polygon if provided
+        if new_polygon is not None:
+            try:
+                if not isinstance(new_polygon, dict) or new_polygon.get('type') != 'Polygon' or not new_polygon.get('coordinates'):
+                    return jsonify({"status": "error", "message": "Invalid polygon"}), 400
+                geom: BaseGeometry = shapely_shape(new_polygon)
+            except Exception:
+                return jsonify({"status": "error", "message": "Invalid polygon coordinates"}), 400
+
+            # Make valid and keep polygonal parts
+            try:
+                try:
+                    from shapely import make_valid as _make_valid  # Shapely >=2
+                except Exception:
+                    try:
+                        from shapely.validation import make_valid as _make_valid  # older
+                    except Exception:
+                        _make_valid = None
+                if not geom.is_valid:
+                    geom = _make_valid(geom) if _make_valid else geom.buffer(0)
+            except Exception:
+                try:
+                    geom = geom.buffer(0)
+                except Exception:
+                    pass
+
+            if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
+                return jsonify({"status": "error", "message": "Resulting geometry is not a polygon"}), 400
+
+            # For now, do not modify overlaps; simply set the provided polygon
+            target['polygon'] = {
+                'type': 'Polygon' if geom.geom_type == 'Polygon' else geom.geom_type,
+                'coordinates': shapely_mapping(geom).get('coordinates')
+            }
+
         _write_refuges(refuges)
         return jsonify({"status": "success", "refuge": target})
     except Exception as e:
