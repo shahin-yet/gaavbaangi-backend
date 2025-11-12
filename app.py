@@ -178,6 +178,53 @@ def _write_refuges(refuges: List[Dict[str, Any]]):
                 os.remove(tmp_path)
         except Exception:
             pass
+
+
+def _make_valid_polygonal(geom: BaseGeometry) -> BaseGeometry:
+    if geom is None:
+        return ShpMultiPolygon([])
+    g = geom
+    try:
+        try:
+            from shapely import make_valid as _make_valid
+        except Exception:
+            try:
+                from shapely.validation import make_valid as _make_valid
+            except Exception:
+                _make_valid = None
+        if not g.is_valid:
+            g = _make_valid(g) if _make_valid else g.buffer(0)
+    except Exception:
+        try:
+            g = g.buffer(0)
+        except Exception:
+            pass
+
+    try:
+        if g.geom_type in ("Polygon", "MultiPolygon"):
+            return g
+        if hasattr(g, 'geoms'):
+            polygon_parts = []
+            for part in g.geoms:
+                if part.geom_type in ("Polygon", "MultiPolygon"):
+                    polygon_parts.append(part)
+            if polygon_parts:
+                try:
+                    return unary_union(polygon_parts)
+                except Exception:
+                    flat = []
+                    for p in polygon_parts:
+                        if p.geom_type == "Polygon":
+                            flat.append(p)
+                        elif p.geom_type == "MultiPolygon":
+                            flat.extend(list(p.geoms))
+                    if flat:
+                        return ShpMultiPolygon(flat)
+        return g
+    except Exception:
+        return g
+
+
 def _safe_unary_union(geoms: List[BaseGeometry]) -> BaseGeometry:
     try:
         return unary_union([g for g in geoms if g and not g.is_empty])
@@ -252,51 +299,6 @@ def create_refuge():
             return jsonify({"status": "error", "message": "Invalid polygon coordinates"}), 400
 
         # Make geometry valid (fix self-intersections) and keep only polygonal parts
-        def _make_valid_polygonal(geom: BaseGeometry) -> BaseGeometry:
-            g = geom
-            try:
-                # Prefer shapely.make_valid if available; fallback to buffer(0)
-                try:
-                    from shapely import make_valid as _make_valid  # Shapely >=2
-                except Exception:
-                    try:
-                        from shapely.validation import make_valid as _make_valid  # older
-                    except Exception:
-                        _make_valid = None
-                if not g.is_valid:
-                    g = _make_valid(g) if _make_valid else g.buffer(0)
-            except Exception:
-                try:
-                    g = g.buffer(0)
-                except Exception:
-                    pass
-
-            # Extract only polygonal components if we got a GeometryCollection
-            try:
-                if g.geom_type in ("Polygon", "MultiPolygon"):
-                    return g
-                if hasattr(g, 'geoms'):
-                    polygon_parts = []
-                    for part in g.geoms:
-                        if part.geom_type in ("Polygon", "MultiPolygon"):
-                            polygon_parts.append(part)
-                    if polygon_parts:
-                        try:
-                            return unary_union(polygon_parts)
-                        except Exception:
-                            # Last resort: flatten to MultiPolygon
-                            flat = []
-                            for p in polygon_parts:
-                                if p.geom_type == "Polygon":
-                                    flat.append(p)
-                                elif p.geom_type == "MultiPolygon":
-                                    flat.extend(list(p.geoms))
-                            if flat:
-                                return ShpMultiPolygon(flat)
-                return g
-            except Exception:
-                return g
-
         new_geom = _make_valid_polygonal(new_geom)
 
         # Collect existing geometries (support Polygon and MultiPolygon already saved)
@@ -610,11 +612,11 @@ def apply_overlay_changes(refuge_id: int):
             geoms: List[BaseGeometry] = []
             for overlay in items:
                 try:
-                    if isinstance(overlay, dict) and overlay.get('type') == 'Polygon' and overlay.get('coordinates'):
+                    if isinstance(overlay, dict) and overlay.get('type') in ('Polygon', 'MultiPolygon') and overlay.get('coordinates'):
                         geom = shapely_shape(overlay)
-                        if not geom.is_valid:
-                            geom = geom.buffer(0)
-                        geoms.append(geom)
+                        geom = _make_valid_polygonal(geom)
+                        if not geom.is_empty and geom.geom_type in ("Polygon", "MultiPolygon"):
+                            geoms.append(geom)
                 except Exception as exc:
                     logger.warning(f"Failed to parse overlay during apply-overlays: {exc}")
             return geoms
@@ -646,6 +648,10 @@ def apply_overlay_changes(refuge_id: int):
             except Exception as exc:
                 logger.error(f"Error subtracting geometries in apply-overlays: {exc}")
                 return jsonify({"status": "error", "message": "Failed to subtract overlays"}), 500
+
+        result_geom = _make_valid_polygonal(result_geom)
+        if result_geom.is_empty or result_geom.geom_type not in ("Polygon", "MultiPolygon"):
+            return jsonify({"status": "error", "message": "Resulting geometry is not a polygon"}), 400
 
         result_geojson = shapely_mapping(result_geom)
         target['polygon'] = {
