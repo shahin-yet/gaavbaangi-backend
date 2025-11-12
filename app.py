@@ -575,6 +575,92 @@ def subtract_overlays(refuge_id: int):
         logger.error(f"Error subtracting overlays: {e}")
         return jsonify({"status": "error", "message": "Failed to subtract overlays"}), 500
 
+
+@app.route('/api/refuges/<int:refuge_id>/apply-overlays', methods=['POST'])
+def apply_overlay_changes(refuge_id: int):
+    """Apply both adjoin and subtract overlay polygons to an existing refuge in a single transaction."""
+    try:
+        payload = request.get_json(force=True) or {}
+        adjoin_payload = payload.get('adjoin') or []
+        subtract_payload = payload.get('subtract') or []
+
+        if not isinstance(adjoin_payload, list) or not isinstance(subtract_payload, list):
+            return jsonify({"status": "error", "message": "Invalid overlays payload"}), 400
+
+        if not adjoin_payload and not subtract_payload:
+            return jsonify({"status": "error", "message": "No overlays provided"}), 400
+
+        refuges = _read_refuges()
+        target = None
+        target_idx = None
+        for i, r in enumerate(refuges):
+            if isinstance(r.get('id'), int) and r.get('id') == refuge_id:
+                target = r
+                target_idx = i
+                break
+
+        if not target or target_idx is None:
+            return jsonify({"status": "error", "message": "Refuge not found"}), 404
+
+        current_geom = shapely_shape(target['polygon'])
+        if not current_geom.is_valid:
+            current_geom = current_geom.buffer(0)
+
+        def _to_geometries(items: List[Any]) -> List[BaseGeometry]:
+            geoms: List[BaseGeometry] = []
+            for overlay in items:
+                try:
+                    if isinstance(overlay, dict) and overlay.get('type') == 'Polygon' and overlay.get('coordinates'):
+                        geom = shapely_shape(overlay)
+                        if not geom.is_valid:
+                            geom = geom.buffer(0)
+                        geoms.append(geom)
+                except Exception as exc:
+                    logger.warning(f"Failed to parse overlay during apply-overlays: {exc}")
+            return geoms
+
+        adjoin_geoms = _to_geometries(adjoin_payload)
+        subtract_geoms = _to_geometries(subtract_payload)
+
+        result_geom = current_geom
+
+        if adjoin_geoms:
+            try:
+                result_geom = _safe_unary_union([result_geom] + adjoin_geoms)
+                if not result_geom.is_valid:
+                    result_geom = result_geom.buffer(0)
+                if result_geom.is_empty or result_geom.area <= 0:
+                    return jsonify({"status": "error", "message": "Resulting geometry is empty after adjoin"}), 400
+            except Exception as exc:
+                logger.error(f"Error adjoining geometries in apply-overlays: {exc}")
+                return jsonify({"status": "error", "message": "Failed to adjoin overlays"}), 500
+
+        if subtract_geoms:
+            try:
+                for overlay_geom in subtract_geoms:
+                    result_geom = _safe_difference(result_geom, overlay_geom)
+                if not result_geom.is_valid:
+                    result_geom = result_geom.buffer(0)
+                if result_geom.is_empty or result_geom.area <= 0:
+                    return jsonify({"status": "error", "message": "Overlay subtraction would remove entire refuge"}), 400
+            except Exception as exc:
+                logger.error(f"Error subtracting geometries in apply-overlays: {exc}")
+                return jsonify({"status": "error", "message": "Failed to subtract overlays"}), 500
+
+        result_geojson = shapely_mapping(result_geom)
+        target['polygon'] = {
+            "type": result_geojson.get("type"),
+            "coordinates": result_geojson.get("coordinates")
+        }
+
+        refuges[target_idx] = target
+        _write_refuges(refuges)
+
+        return jsonify({"status": "success", "refuge": target})
+    except Exception as e:
+        logger.error(f"Error applying overlay changes: {e}")
+        return jsonify({"status": "error", "message": "Failed to apply overlay changes"}), 500
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"status": "error", "message": "Resource not found"}), 404
