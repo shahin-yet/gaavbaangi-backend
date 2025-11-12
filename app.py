@@ -418,6 +418,163 @@ def delete_refuge(refuge_id: int):
         logger.error(f"Error deleting refuge: {e}")
         return jsonify({"status": "error", "message": "Failed to delete refuge"}), 500
 
+
+@app.route('/api/refuges/<int:refuge_id>/adjoin', methods=['POST'])
+def adjoin_overlays(refuge_id: int):
+    """Adjoin (union) overlay polygons to an existing refuge."""
+    try:
+        payload = request.get_json(force=True) or {}
+        overlays = payload.get('overlays', [])
+        
+        if not overlays or not isinstance(overlays, list):
+            return jsonify({"status": "error", "message": "No overlays provided"}), 400
+        
+        refuges = _read_refuges()
+        
+        # Find target refuge
+        target = None
+        target_idx = None
+        for i, r in enumerate(refuges):
+            if isinstance(r.get('id'), int) and r.get('id') == refuge_id:
+                target = r
+                target_idx = i
+                break
+        
+        if not target:
+            return jsonify({"status": "error", "message": "Refuge not found"}), 404
+        
+        # Get current refuge geometry
+        current_geom = shapely_shape(target['polygon'])
+        if not current_geom.is_valid:
+            current_geom = current_geom.buffer(0)
+        
+        # Convert overlays to Shapely geometries
+        overlay_geoms = []
+        for overlay in overlays:
+            try:
+                if overlay.get('type') == 'Polygon' and overlay.get('coordinates'):
+                    geom = shapely_shape(overlay)
+                    if not geom.is_valid:
+                        geom = geom.buffer(0)
+                    overlay_geoms.append(geom)
+            except Exception as e:
+                logger.warning(f"Failed to parse overlay: {e}")
+                continue
+        
+        if not overlay_geoms:
+            return jsonify({"status": "error", "message": "No valid overlays to adjoin"}), 400
+        
+        # Union all geometries together
+        try:
+            all_geoms = [current_geom] + overlay_geoms
+            result_geom = _safe_unary_union(all_geoms)
+            
+            # Ensure result is valid
+            if not result_geom.is_valid:
+                result_geom = result_geom.buffer(0)
+            
+            if result_geom.is_empty or result_geom.area <= 0:
+                return jsonify({"status": "error", "message": "Resulting geometry is empty"}), 400
+        except Exception as e:
+            logger.error(f"Error adjoining geometries: {e}")
+            return jsonify({"status": "error", "message": "Failed to adjoin geometries"}), 500
+        
+        # Convert back to GeoJSON
+        result_geojson = shapely_mapping(result_geom)
+        
+        # Update refuge with new geometry
+        target['polygon'] = {
+            "type": result_geojson.get("type"),
+            "coordinates": result_geojson.get("coordinates")
+        }
+        
+        refuges[target_idx] = target
+        _write_refuges(refuges)
+        
+        return jsonify({"status": "success", "refuge": target})
+    except Exception as e:
+        logger.error(f"Error adjoining overlays: {e}")
+        return jsonify({"status": "error", "message": "Failed to adjoin overlays"}), 500
+
+
+@app.route('/api/refuges/<int:refuge_id>/subtract', methods=['POST'])
+def subtract_overlays(refuge_id: int):
+    """Subtract overlay polygons from an existing refuge."""
+    try:
+        payload = request.get_json(force=True) or {}
+        overlays = payload.get('overlays', [])
+        
+        if not overlays or not isinstance(overlays, list):
+            return jsonify({"status": "error", "message": "No overlays provided"}), 400
+        
+        refuges = _read_refuges()
+        
+        # Find target refuge
+        target = None
+        target_idx = None
+        for i, r in enumerate(refuges):
+            if isinstance(r.get('id'), int) and r.get('id') == refuge_id:
+                target = r
+                target_idx = i
+                break
+        
+        if not target:
+            return jsonify({"status": "error", "message": "Refuge not found"}), 404
+        
+        # Get current refuge geometry
+        current_geom = shapely_shape(target['polygon'])
+        if not current_geom.is_valid:
+            current_geom = current_geom.buffer(0)
+        
+        # Convert overlays to Shapely geometries
+        overlay_geoms = []
+        for overlay in overlays:
+            try:
+                if overlay.get('type') == 'Polygon' and overlay.get('coordinates'):
+                    geom = shapely_shape(overlay)
+                    if not geom.is_valid:
+                        geom = geom.buffer(0)
+                    overlay_geoms.append(geom)
+            except Exception as e:
+                logger.warning(f"Failed to parse overlay: {e}")
+                continue
+        
+        if not overlay_geoms:
+            return jsonify({"status": "error", "message": "No valid overlays to subtract"}), 400
+        
+        # Subtract all overlay geometries from current geometry
+        try:
+            result_geom = current_geom
+            for overlay_geom in overlay_geoms:
+                result_geom = _safe_difference(result_geom, overlay_geom)
+            
+            # Ensure result is valid
+            if not result_geom.is_valid:
+                result_geom = result_geom.buffer(0)
+            
+            if result_geom.is_empty or result_geom.area <= 0:
+                return jsonify({"status": "error", "message": "Subtraction would remove entire refuge"}), 400
+        except Exception as e:
+            logger.error(f"Error subtracting geometries: {e}")
+            return jsonify({"status": "error", "message": "Failed to subtract geometries"}), 500
+        
+        # Convert back to GeoJSON
+        result_geojson = shapely_mapping(result_geom)
+        
+        # Update refuge with new geometry
+        target['polygon'] = {
+            "type": result_geojson.get("type"),
+            "coordinates": result_geojson.get("coordinates")
+        }
+        
+        refuges[target_idx] = target
+        _write_refuges(refuges)
+        
+        return jsonify({"status": "success", "refuge": target})
+    except Exception as e:
+        logger.error(f"Error subtracting overlays: {e}")
+        return jsonify({"status": "error", "message": "Failed to subtract overlays"}), 500
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"status": "error", "message": "Resource not found"}), 404
