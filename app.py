@@ -226,24 +226,54 @@ def _make_valid_polygonal(geom: BaseGeometry) -> BaseGeometry:
 
 
 def _safe_unary_union(geoms: List[BaseGeometry]) -> BaseGeometry:
-    try:
-        return unary_union([g for g in geoms if g and not g.is_empty])
-    except Exception:
+    cleaned: List[BaseGeometry] = []
+    for geom in geoms:
+        if not geom:
+            continue
         try:
-            # Attempt to validify components and union again
-            fixed = []
-            for g in geoms:
-                if not g or g.is_empty:
-                    continue
-                try:
-                    gg = g if g.is_valid else g.buffer(0)
-                    fixed.append(gg)
-                except Exception:
-                    continue
-            return unary_union(fixed) if fixed else ShpMultiPolygon([])
+            if geom.is_empty:
+                continue
         except Exception:
-            # Last resort: pick the first geometry
-            return geoms[0] if geoms else ShpMultiPolygon([])
+            continue
+        try:
+            cleaned_geom = _make_valid_polygonal(geom)
+        except Exception:
+            cleaned_geom = geom
+        if cleaned_geom and not cleaned_geom.is_empty:
+            cleaned.append(cleaned_geom)
+
+    if not cleaned:
+        return ShpMultiPolygon([])
+    if len(cleaned) == 1:
+        return cleaned[0]
+
+    try:
+        result = unary_union(cleaned)
+        if not result.is_valid:
+            result = result.buffer(0)
+        return _make_valid_polygonal(result)
+    except Exception as exc:
+        logger.warning(f"unary_union failed; falling back to pairwise union: {exc}")
+        result = cleaned[0]
+        for geom in cleaned[1:]:
+            if not result or result.is_empty:
+                result = geom
+                continue
+            try:
+                merged = result.union(geom)
+            except Exception:
+                try:
+                    merged = unary_union([result, geom])
+                except Exception as pair_exc:
+                    logger.warning(f"Pairwise union failed, skipping overlay: {pair_exc}")
+                    continue
+            if not merged.is_valid:
+                try:
+                    merged = merged.buffer(0)
+                except Exception:
+                    pass
+            result = _make_valid_polygonal(merged)
+        return result
 
 def _safe_difference(a: BaseGeometry, b: BaseGeometry) -> BaseGeometry:
     try:
@@ -446,9 +476,13 @@ def adjoin_overlays(refuge_id: int):
             return jsonify({"status": "error", "message": "Refuge not found"}), 404
         
         # Get current refuge geometry
-        current_geom = shapely_shape(target['polygon'])
-        if not current_geom.is_valid:
-            current_geom = current_geom.buffer(0)
+        try:
+            current_geom = shapely_shape(target['polygon'])
+        except Exception:
+            return jsonify({"status": "error", "message": "Stored refuge geometry is invalid"}), 500
+        current_geom = _make_valid_polygonal(current_geom)
+        if current_geom.is_empty:
+            return jsonify({"status": "error", "message": "Stored refuge geometry is empty"}), 500
         
         # Convert overlays to Shapely geometries
         overlay_geoms = []
@@ -524,9 +558,13 @@ def subtract_overlays(refuge_id: int):
             return jsonify({"status": "error", "message": "Refuge not found"}), 404
         
         # Get current refuge geometry
-        current_geom = shapely_shape(target['polygon'])
-        if not current_geom.is_valid:
-            current_geom = current_geom.buffer(0)
+        try:
+            current_geom = shapely_shape(target['polygon'])
+        except Exception:
+            return jsonify({"status": "error", "message": "Stored refuge geometry is invalid"}), 500
+        current_geom = _make_valid_polygonal(current_geom)
+        if current_geom.is_empty:
+            return jsonify({"status": "error", "message": "Stored refuge geometry is empty"}), 500
         
         # Convert overlays to Shapely geometries
         overlay_geoms = []
@@ -604,9 +642,13 @@ def apply_overlay_changes(refuge_id: int):
         if not target or target_idx is None:
             return jsonify({"status": "error", "message": "Refuge not found"}), 404
 
-        current_geom = shapely_shape(target['polygon'])
-        if not current_geom.is_valid:
-            current_geom = current_geom.buffer(0)
+        try:
+            current_geom = shapely_shape(target['polygon'])
+        except Exception:
+            return jsonify({"status": "error", "message": "Stored refuge geometry is invalid"}), 500
+        current_geom = _make_valid_polygonal(current_geom)
+        if current_geom.is_empty:
+            return jsonify({"status": "error", "message": "Stored refuge geometry is empty"}), 500
 
         def _to_geometries(items: List[Any]) -> List[BaseGeometry]:
             geoms: List[BaseGeometry] = []
