@@ -663,6 +663,17 @@ def apply_overlay_changes(refuge_id: int):
                     logger.warning(f"Failed to parse overlay during apply-overlays: {exc}")
             return geoms
 
+        def _count_components(geom: BaseGeometry) -> int:
+            if geom is None or geom.is_empty:
+                return 0
+            if geom.geom_type == "Polygon":
+                return 1
+            if geom.geom_type == "MultiPolygon":
+                return sum(1 for g in geom.geoms if not g.is_empty)
+            if geom.geom_type == "GeometryCollection":
+                return sum(_count_components(g) for g in geom.geoms)
+            return 0
+
         adjoin_geoms = _to_geometries(adjoin_payload)
         subtract_geoms = _to_geometries(subtract_payload)
 
@@ -678,15 +689,19 @@ def apply_overlay_changes(refuge_id: int):
             except Exception as exc:
                 logger.error(f"Error adjoining geometries in apply-overlays: {exc}")
                 return jsonify({"status": "error", "message": "Failed to adjoin overlays"}), 500
-
         if subtract_geoms:
+            initial_components = max(_count_components(result_geom), 1)
             try:
                 for overlay_geom in subtract_geoms:
                     result_geom = _safe_difference(result_geom, overlay_geom)
+                result_geom = _make_valid_polygonal(result_geom)
                 if not result_geom.is_valid:
                     result_geom = result_geom.buffer(0)
                 if result_geom.is_empty or result_geom.area <= 0:
                     return jsonify({"status": "error", "message": "Overlay subtraction would remove entire refuge"}), 400
+                updated_components = _count_components(result_geom)
+                if updated_components > initial_components:
+                    return jsonify({"status": "error", "message": "Overlay subtraction would split refuge into multiple areas"}), 400
             except Exception as exc:
                 logger.error(f"Error subtracting geometries in apply-overlays: {exc}")
                 return jsonify({"status": "error", "message": "Failed to subtract overlays"}), 500
