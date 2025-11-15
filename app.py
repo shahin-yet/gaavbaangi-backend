@@ -376,6 +376,39 @@ def create_refuge():
             if result_geom.is_empty or result_geom.geom_type not in ("Polygon", "MultiPolygon"):
                 return jsonify({"status": "error", "message": "Resulting geometry is not a polygon"}), 400
 
+        # If subtraction resulted in MultiPolygon, keep only the part containing the first vertex
+        if result_geom.geom_type == "MultiPolygon":
+            try:
+                # Get the first vertex from the original polygon
+                first_coords = polygon['coordinates'][0][0]  # [lng, lat]
+                from shapely.geometry import Point
+                first_point = Point(first_coords[0], first_coords[1])
+                
+                # Find which polygon contains the first vertex
+                kept_polygon = None
+                for poly in result_geom.geoms:
+                    if poly.contains(first_point) or poly.boundary.distance(first_point) < 1e-9:
+                        kept_polygon = poly
+                        break
+                
+                # If no polygon contains the first point exactly, find the nearest one
+                if kept_polygon is None:
+                    min_distance = float('inf')
+                    for poly in result_geom.geoms:
+                        dist = poly.distance(first_point)
+                        if dist < min_distance:
+                            min_distance = dist
+                            kept_polygon = poly
+                
+                if kept_polygon and not kept_polygon.is_empty:
+                    result_geom = kept_polygon
+                    logger.info(f"MultiPolygon result after subtraction: kept only polygon containing first vertex")
+                else:
+                    return jsonify({"status": "error", "message": "Could not determine which part to keep after subtraction"}), 400
+            except Exception as e:
+                logger.warning(f"Failed to filter MultiPolygon by first vertex: {e}")
+                # Continue with the full MultiPolygon if filtering fails
+
         # Convert back to GeoJSON geometry
         result_geojson = shapely_mapping(result_geom)
 
@@ -690,8 +723,23 @@ def apply_overlay_changes(refuge_id: int):
                 logger.error(f"Error adjoining geometries in apply-overlays: {exc}")
                 return jsonify({"status": "error", "message": "Failed to adjoin overlays"}), 500
         if subtract_geoms:
-            initial_components = max(_count_components(result_geom), 1)
             try:
+                # Store the first vertex before subtraction
+                from shapely.geometry import Point
+                first_vertex_point = None
+                try:
+                    # Get the first vertex from the current refuge geometry
+                    if current_geom.geom_type == "Polygon":
+                        first_coords = list(current_geom.exterior.coords)[0]
+                    elif current_geom.geom_type == "MultiPolygon":
+                        first_coords = list(list(current_geom.geoms)[0].exterior.coords)[0]
+                    else:
+                        first_coords = None
+                    if first_coords:
+                        first_vertex_point = Point(first_coords[0], first_coords[1])
+                except Exception:
+                    pass
+                
                 for overlay_geom in subtract_geoms:
                     result_geom = _safe_difference(result_geom, overlay_geom)
                 result_geom = _make_valid_polygonal(result_geom)
@@ -699,9 +747,35 @@ def apply_overlay_changes(refuge_id: int):
                     result_geom = result_geom.buffer(0)
                 if result_geom.is_empty or result_geom.area <= 0:
                     return jsonify({"status": "error", "message": "Overlay subtraction would remove entire refuge"}), 400
-                updated_components = _count_components(result_geom)
-                if updated_components > initial_components:
-                    return jsonify({"status": "error", "message": "Overlay subtraction would split refuge into multiple areas"}), 400
+                
+                # If subtraction resulted in MultiPolygon, keep only the part containing the first vertex
+                if result_geom.geom_type == "MultiPolygon" and first_vertex_point:
+                    try:
+                        # Find which polygon contains the first vertex
+                        kept_polygon = None
+                        for poly in result_geom.geoms:
+                            if poly.contains(first_vertex_point) or poly.boundary.distance(first_vertex_point) < 1e-9:
+                                kept_polygon = poly
+                                break
+                        
+                        # If no polygon contains the first point exactly, find the nearest one
+                        if kept_polygon is None:
+                            min_distance = float('inf')
+                            for poly in result_geom.geoms:
+                                dist = poly.distance(first_vertex_point)
+                                if dist < min_distance:
+                                    min_distance = dist
+                                    kept_polygon = poly
+                        
+                        if kept_polygon and not kept_polygon.is_empty:
+                            result_geom = kept_polygon
+                            logger.info(f"MultiPolygon result after overlay subtraction: kept only polygon containing first vertex")
+                        else:
+                            logger.warning("Could not determine which part to keep after overlay subtraction, keeping all parts")
+                    except Exception as e:
+                        logger.warning(f"Failed to filter MultiPolygon by first vertex in overlay subtraction: {e}")
+                        # Continue with the full MultiPolygon if filtering fails
+                
             except Exception as exc:
                 logger.error(f"Error subtracting geometries in apply-overlays: {exc}")
                 return jsonify({"status": "error", "message": "Failed to subtract overlays"}), 500
