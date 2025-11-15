@@ -139,7 +139,6 @@ def init_data():
 # Allow overriding data directory via environment for persistent disks
 DATA_DIR = os.getenv('DATA_DIR') or os.path.join(os.path.dirname(__file__), 'data')
 REFUGES_FILE = os.path.join(DATA_DIR, 'refuges.json')
-REFUGE_GEOM_OVERLAP_EPSILON = 1e-9
 
 def _ensure_data_file():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -341,30 +340,32 @@ def create_refuge():
                     existing_geoms.append(_make_valid_polygonal(shapely_shape(g)))
             except Exception:
                 continue
-        # Ensure the new geometry does not overlap any existing refuge
-        if existing_geoms:
-            try:
-                for eg in existing_geoms:
-                    if eg.is_empty or not eg.is_valid:
-                        continue
-                    # Quick envelope check to skip obvious non-overlaps
-                    if not new_geom.envelope.intersects(eg.envelope):
-                        continue
-                    if new_geom.disjoint(eg):
-                        continue
-                    overlap_geom = new_geom.intersection(eg)
-                    if overlap_geom.is_empty:
-                        continue
-                    if overlap_geom.area > REFUGE_GEOM_OVERLAP_EPSILON:
-                        return jsonify({
-                            "status": "error",
-                            "message": "New refuge overlaps an existing refuge area"
-                        }), 409
-            except Exception as exc:
-                logger.error(f"Failed to evaluate refuge overlap: {exc}")
-                return jsonify({"status": "error", "message": "Failed to validate refuge overlap"}), 400
 
-        result_geom = new_geom
+        # Subtract overlaps from the new geometry
+        try:
+            # Start from original geometry
+            result_geom = new_geom
+            if existing_geoms:
+                # First, try a fast union-based subtraction
+                try:
+                    existing_union = _safe_unary_union(existing_geoms)
+                    result_geom = _safe_difference(result_geom, existing_union)
+                except Exception:
+                    # If union fails for any reason, continue with sequential subtraction below
+                    pass
+
+                # Robust fallback: sequentially subtract each existing geometry as well.
+                # This ensures that if the union step above partially failed, all overlaps
+                # are still removed.
+                for eg in existing_geoms:
+                    try:
+                        if not result_geom.is_empty:
+                            result_geom = _safe_difference(result_geom, eg)
+                    except Exception:
+                        # _safe_difference already has internal fallbacks; call again to be safe
+                        result_geom = _safe_difference(result_geom, eg)
+        except Exception:
+            return jsonify({"status": "error", "message": "Failed to process geometry"}), 400
 
         # Ensure the result has area and is of polygonal type
         if result_geom.is_empty or result_geom.area <= 0:
