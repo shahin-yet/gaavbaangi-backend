@@ -920,6 +920,40 @@ def apply_overlay_changes(refuge_id: int):
                     result_geom = result_geom.buffer(0)
                 if result_geom.is_empty or result_geom.area <= 0:
                     return jsonify({"status": "error", "message": "Resulting geometry is empty after adjoin"}), 400
+
+                # After adjoining, drop any pieces that are no longer directly connected
+                # to the original refuge area. This prevents "split" islands from being kept.
+                if result_geom.geom_type == "MultiPolygon":
+                    connected_parts: list[BaseGeometry] = []
+                    for poly in result_geom.geoms:
+                        try:
+                            if poly.is_empty:
+                                continue
+                            # Consider a part connected if it intersects or touches the original refuge.
+                            if poly.intersects(current_geom) or poly.touches(current_geom):
+                                connected_parts.append(poly)
+                        except Exception:
+                            continue
+
+                    if connected_parts:
+                        if len(connected_parts) == 1:
+                            result_geom = connected_parts[0]
+                        else:
+                            result_geom = _safe_unary_union(connected_parts)
+                        # Re-validate after filtering
+                        result_geom = _make_valid_polygonal(result_geom)
+                        if result_geom.is_empty or result_geom.area <= 0:
+                            return jsonify(
+                                {"status": "error", "message": "Resulting geometry became empty after filtering disconnected parts"}
+                            ), 400
+                    else:
+                        # No part of the adjoined result is connected to the original refuge;
+                        # discard adjoin effects and keep the original geometry.
+                        logger.info(
+                            "All adjoin overlay parts are disconnected from original refuge; "
+                            "discarding adjoin changes for this operation."
+                        )
+                        result_geom = current_geom
             except Exception as exc:
                 logger.error(f"Error adjoining geometries in apply-overlays: {exc}")
                 return jsonify({"status": "error", "message": "Failed to adjoin overlays"}), 500
