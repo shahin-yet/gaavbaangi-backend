@@ -293,6 +293,87 @@ def _safe_difference(a: BaseGeometry, b: BaseGeometry) -> BaseGeometry:
                 return a
 
 
+def _subtract_overlay_from_other_refuges(
+    refuges: List[Dict[str, Any]],
+    target_id: int,
+    overlay_geom: BaseGeometry
+) -> tuple[List[Dict[str, Any]], List[int]]:
+    """Subtract overlay geometry from all non-target refuges."""
+    if overlay_geom is None:
+        return refuges, []
+
+    try:
+        overlay_geom = _make_valid_polygonal(overlay_geom)
+    except Exception:
+        pass
+
+    if overlay_geom is None or overlay_geom.is_empty:
+        return refuges, []
+
+    updated_refuges: List[Dict[str, Any]] = []
+    removed_ids: List[int] = []
+
+    for refuge in refuges:
+        if not isinstance(refuge, dict):
+            updated_refuges.append(refuge)
+            continue
+
+        refuge_id = refuge.get('id')
+        if refuge_id == target_id:
+            updated_refuges.append(refuge)
+            continue
+
+        polygon = refuge.get('polygon')
+        if not polygon or polygon.get('type') not in ('Polygon', 'MultiPolygon'):
+            updated_refuges.append(refuge)
+            continue
+
+        try:
+            geom = _make_valid_polygonal(shapely_shape(polygon))
+        except Exception as exc:
+            logger.warning(f"Skipping refuge {refuge_id} during overlap subtraction: invalid geometry ({exc})")
+            updated_refuges.append(refuge)
+            continue
+
+        if geom.is_empty or not geom.intersects(overlay_geom):
+            updated_refuges.append(refuge)
+            continue
+
+        try:
+            new_geom = _safe_difference(geom, overlay_geom)
+            new_geom = _make_valid_polygonal(new_geom)
+        except Exception as exc:
+            logger.warning(f"Failed to subtract overlay from refuge {refuge_id}: {exc}")
+            updated_refuges.append(refuge)
+            continue
+
+        if new_geom.is_empty or (hasattr(new_geom, 'area') and new_geom.area <= 0):
+            if refuge_id is not None:
+                removed_ids.append(refuge_id)
+                logger.info(f"Overlay subtraction removed refuge {refuge_id} entirely; deleting refuge.")
+            continue
+
+        if new_geom.geom_type not in ("Polygon", "MultiPolygon"):
+            logger.warning(f"Overlay subtraction for refuge {refuge_id} produced {new_geom.geom_type}; skipping update.")
+            updated_refuges.append(refuge)
+            continue
+
+        try:
+            geojson = shapely_mapping(new_geom)
+        except Exception as exc:
+            logger.warning(f"Failed to serialize geometry for refuge {refuge_id}: {exc}")
+            updated_refuges.append(refuge)
+            continue
+
+        refuge['polygon'] = {
+            "type": geojson.get("type"),
+            "coordinates": geojson.get("coordinates")
+        }
+        updated_refuges.append(refuge)
+
+    return updated_refuges, removed_ids
+
+
 
 @app.route('/api/refuges', methods=['GET'])
 def list_refuges():
@@ -710,6 +791,19 @@ def apply_overlay_changes(refuge_id: int):
         adjoin_geoms = _to_geometries(adjoin_payload)
         subtract_geoms = _to_geometries(subtract_payload)
 
+        adjoin_union_for_others: BaseGeometry | None = None
+        if adjoin_geoms:
+            try:
+                adjoin_union_for_others = _safe_unary_union(adjoin_geoms)
+                adjoin_union_for_others = _make_valid_polygonal(adjoin_union_for_others)
+                if adjoin_union_for_others.is_empty:
+                    adjoin_union_for_others = None
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to prepare adjoin overlay union for cross-refuge subtraction: {exc}"
+                )
+                adjoin_union_for_others = None
+
         result_geom = current_geom
 
         if adjoin_geoms:
@@ -791,6 +885,27 @@ def apply_overlay_changes(refuge_id: int):
         }
 
         refuges[target_idx] = target
+
+        if adjoin_union_for_others is not None:
+            refuges, removed_refuge_ids = _subtract_overlay_from_other_refuges(
+                refuges,
+                target.get('id'),
+                adjoin_union_for_others
+            )
+            if removed_refuge_ids:
+                logger.info(f"Removed refuges after cross-refuge subtraction: {removed_refuge_ids}")
+
+            target_idx = None
+            for idx, refuge in enumerate(refuges):
+                if isinstance(refuge, dict) and refuge.get('id') == target.get('id'):
+                    target_idx = idx
+                    break
+            if target_idx is None:
+                refuges.append(target)
+                target_idx = len(refuges) - 1
+
+            refuges[target_idx] = target
+
         _write_refuges(refuges)
 
         return jsonify({"status": "success", "refuge": target})
