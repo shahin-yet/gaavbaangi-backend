@@ -614,6 +614,46 @@ def adjoin_overlays(refuge_id: int):
         if not overlay_geoms:
             return jsonify({"status": "error", "message": "No valid overlays to adjoin"}), 400
         
+        # Before processing overlays, subtract overlapping unrelated refuges from them
+        # Collect all unrelated refuge geometries
+        unrelated_refuge_geoms: List[BaseGeometry] = []
+        for r in refuges:
+            if isinstance(r.get('id'), int) and r.get('id') != refuge_id:
+                try:
+                    g = r.get('polygon')
+                    if g and isinstance(g, dict) and g.get('type') in ("Polygon", "MultiPolygon"):
+                        unrelated_geom = _make_valid_polygonal(shapely_shape(g))
+                        if not unrelated_geom.is_empty:
+                            unrelated_refuge_geoms.append(unrelated_geom)
+                except Exception:
+                    continue
+        
+        # Subtract unrelated refuges from each overlay
+        if unrelated_refuge_geoms:
+            try:
+                unrelated_union = _safe_unary_union(unrelated_refuge_geoms)
+                if not unrelated_union.is_empty:
+                    cleaned_overlay_geoms = []
+                    for overlay_geom in overlay_geoms:
+                        try:
+                            # Subtract unrelated refuges from this overlay
+                            cleaned_geom = _safe_difference(overlay_geom, unrelated_union)
+                            cleaned_geom = _make_valid_polygonal(cleaned_geom)
+                            if not cleaned_geom.is_empty and cleaned_geom.area > 0:
+                                cleaned_overlay_geoms.append(cleaned_geom)
+                            else:
+                                logger.info(f"Overlay completely overlapped with unrelated refuges; skipping.")
+                        except Exception as exc:
+                            logger.warning(f"Failed to subtract unrelated refuges from overlay: {exc}")
+                            # Keep the original overlay if subtraction fails
+                            cleaned_overlay_geoms.append(overlay_geom)
+                    overlay_geoms = cleaned_overlay_geoms
+            except Exception as exc:
+                logger.warning(f"Failed to create union of unrelated refuges: {exc}")
+        
+        if not overlay_geoms:
+            return jsonify({"status": "error", "message": "All overlays completely overlap with other refuges"}), 400
+        
         # Union all geometries together
         try:
             all_geoms = [current_geom] + overlay_geoms
@@ -639,6 +679,35 @@ def adjoin_overlays(refuge_id: int):
         }
         
         refuges[target_idx] = target
+        
+        # Now subtract the adjoined overlays from other refuges
+        # Create union of the overlay geometries that were actually applied
+        try:
+            overlays_union = _safe_unary_union(overlay_geoms)
+            overlays_union = _make_valid_polygonal(overlays_union)
+            if not overlays_union.is_empty:
+                refuges, removed_refuge_ids = _subtract_overlay_from_other_refuges(
+                    refuges,
+                    target.get('id'),
+                    overlays_union
+                )
+                if removed_refuge_ids:
+                    logger.info(f"Removed refuges after cross-refuge subtraction in adjoin: {removed_refuge_ids}")
+                
+                # Re-find target index after potential removals
+                target_idx = None
+                for idx, refuge in enumerate(refuges):
+                    if isinstance(refuge, dict) and refuge.get('id') == target.get('id'):
+                        target_idx = idx
+                        break
+                if target_idx is None:
+                    refuges.append(target)
+                    target_idx = len(refuges) - 1
+                
+                refuges[target_idx] = target
+        except Exception as exc:
+            logger.warning(f"Failed to subtract overlays from other refuges: {exc}")
+        
         _write_refuges(refuges)
         
         return jsonify({"status": "success", "refuge": target})
@@ -790,6 +859,44 @@ def apply_overlay_changes(refuge_id: int):
 
         adjoin_geoms = _to_geometries(adjoin_payload)
         subtract_geoms = _to_geometries(subtract_payload)
+
+        # Before processing adjoin overlays, subtract overlapping unrelated refuges from them
+        if adjoin_geoms:
+            # Collect all unrelated refuge geometries
+            unrelated_refuge_geoms: List[BaseGeometry] = []
+            for r in refuges:
+                if isinstance(r.get('id'), int) and r.get('id') != refuge_id:
+                    try:
+                        g = r.get('polygon')
+                        if g and isinstance(g, dict) and g.get('type') in ("Polygon", "MultiPolygon"):
+                            unrelated_geom = _make_valid_polygonal(shapely_shape(g))
+                            if not unrelated_geom.is_empty:
+                                unrelated_refuge_geoms.append(unrelated_geom)
+                    except Exception:
+                        continue
+            
+            # Subtract unrelated refuges from each adjoin overlay
+            if unrelated_refuge_geoms:
+                try:
+                    unrelated_union = _safe_unary_union(unrelated_refuge_geoms)
+                    if not unrelated_union.is_empty:
+                        cleaned_adjoin_geoms = []
+                        for adjoin_geom in adjoin_geoms:
+                            try:
+                                # Subtract unrelated refuges from this overlay
+                                cleaned_geom = _safe_difference(adjoin_geom, unrelated_union)
+                                cleaned_geom = _make_valid_polygonal(cleaned_geom)
+                                if not cleaned_geom.is_empty and cleaned_geom.area > 0:
+                                    cleaned_adjoin_geoms.append(cleaned_geom)
+                                else:
+                                    logger.info(f"Adjoin overlay completely overlapped with unrelated refuges; skipping.")
+                            except Exception as exc:
+                                logger.warning(f"Failed to subtract unrelated refuges from adjoin overlay: {exc}")
+                                # Keep the original overlay if subtraction fails
+                                cleaned_adjoin_geoms.append(adjoin_geom)
+                        adjoin_geoms = cleaned_adjoin_geoms
+                except Exception as exc:
+                    logger.warning(f"Failed to create union of unrelated refuges: {exc}")
 
         adjoin_union_for_others: BaseGeometry | None = None
         if adjoin_geoms:
