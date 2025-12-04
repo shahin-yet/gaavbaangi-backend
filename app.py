@@ -404,79 +404,6 @@ def _subtract_overlay_from_other_refuges(
     return updated_refuges, removed_ids
 
 
-def _carve_nested_refuges(
-    refuges: List[Dict[str, Any]],
-    carve_geom: BaseGeometry
-) -> bool:
-    """Cut carve_geom out of any refuges that completely contain it."""
-    if carve_geom is None:
-        return False
-    try:
-        carve_geom = _make_valid_polygonal(carve_geom)
-    except Exception:
-        pass
-
-    if carve_geom is None or carve_geom.is_empty:
-        return False
-
-    carved_any = False
-    for refuge in refuges:
-        if not isinstance(refuge, dict):
-            continue
-
-        polygon = refuge.get('polygon')
-        if not polygon or polygon.get('type') not in ('Polygon', 'MultiPolygon'):
-            continue
-
-        try:
-            geom = _make_valid_polygonal(shapely_shape(polygon))
-        except Exception as exc:
-            logger.warning(f"Skipping refuge {refuge.get('id')} during nested carve: invalid geometry ({exc})")
-            continue
-
-        if geom.is_empty:
-            continue
-
-        try:
-            covers_candidate = geom.covers(carve_geom)
-        except Exception:
-            try:
-                covers_candidate = geom.buffer(0).covers(carve_geom)
-            except Exception:
-                covers_candidate = False
-
-        if not covers_candidate:
-            continue
-
-        try:
-            new_geom = _safe_difference(geom, carve_geom)
-            new_geom = _make_valid_polygonal(new_geom)
-        except Exception as exc:
-            logger.warning(f"Failed to carve refuge {refuge.get('id')}: {exc}")
-            continue
-
-        if new_geom.is_empty or (hasattr(new_geom, 'area') and new_geom.area <= 0):
-            logger.warning(f"Carving refuge {refuge.get('id')} would remove it entirely; skipping carve for this refuge.")
-            continue
-
-        if new_geom.geom_type not in ("Polygon", "MultiPolygon"):
-            logger.warning(f"Carving refuge {refuge.get('id')} produced {new_geom.geom_type}; skipping update.")
-            continue
-
-        try:
-            geojson = shapely_mapping(new_geom)
-        except Exception as exc:
-            logger.warning(f"Failed to serialize carved geometry for refuge {refuge.get('id')}: {exc}")
-            continue
-
-        refuge['polygon'] = {
-            "type": geojson.get("type"),
-            "coordinates": geojson.get("coordinates")
-        }
-        carved_any = True
-
-    return carved_any
-
 
 @app.route('/api/refuges', methods=['GET'])
 def list_refuges():
@@ -553,21 +480,7 @@ def create_refuge():
 
         # Ensure the result has area and is of polygonal type
         if result_geom.is_empty or result_geom.area <= 0:
-            carved_nested = False
-            try:
-                carved_nested = _carve_nested_refuges(refuges, new_geom)
-            except Exception as exc:
-                logger.warning(f"Failed to carve nested refuge: {exc}")
-
-            if carved_nested:
-                logger.info("New refuge drawn entirely inside existing area; carved holes in parent refuges.")
-                result_geom = new_geom
-            else:
-                return jsonify({
-                    "status": "error",
-                    "code": "REFUGE_INSIDE_EXISTING",
-                    "message": "Refuge overlaps existing areas completely; nothing to save"
-                }), 400
+            return jsonify({"status": "error", "message": "Refuge overlaps existing areas completely; nothing to save"}), 400
         # If geometry collection slipped through, keep only polygonal parts
         if result_geom.geom_type not in ("Polygon", "MultiPolygon"):
             result_geom = _make_valid_polygonal(result_geom)
