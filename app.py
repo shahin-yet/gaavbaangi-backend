@@ -444,11 +444,36 @@ def create_refuge():
 
         # Collect existing geometries (support Polygon and MultiPolygon already saved)
         existing_geoms: List[BaseGeometry] = []
+        contained_geoms: List[BaseGeometry] = []
         for r in refuges:
             try:
                 g = r.get('polygon')
                 if g and isinstance(g, dict) and g.get('type') in ("Polygon", "MultiPolygon"):
-                    existing_geoms.append(_make_valid_polygonal(shapely_shape(g)))
+                    existing_geom = _make_valid_polygonal(shapely_shape(g))
+                    try:
+                        if existing_geom is None or existing_geom.is_empty:
+                            continue
+                    except Exception:
+                        continue
+
+                    existing_geoms.append(existing_geom)
+
+                    # Detect refuges that are fully inside the newly drawn refuge so we can carve holes
+                    try:
+                        if new_geom.covers(existing_geom):
+                            contained_geoms.append(existing_geom)
+                        else:
+                            # Retry with a validity buffer to avoid precision edge cases
+                            buffered_new = new_geom.buffer(0)
+                            if buffered_new.covers(existing_geom):
+                                contained_geoms.append(existing_geom)
+                    except Exception:
+                        try:
+                            buffered_new = new_geom.buffer(0)
+                            if buffered_new.covers(existing_geom):
+                                contained_geoms.append(existing_geom)
+                        except Exception:
+                            pass
             except Exception:
                 continue
 
@@ -456,6 +481,22 @@ def create_refuge():
         try:
             # Start from original geometry
             result_geom = new_geom
+            # First carve out any existing refuges that are fully contained so those areas remain untouched
+            if contained_geoms:
+                try:
+                    contained_union = _safe_unary_union(contained_geoms)
+                    if contained_union and not contained_union.is_empty:
+                        result_geom = _safe_difference(result_geom, contained_union)
+                        logger.info(f"New refuge minus {len(contained_geoms)} contained refuges.")
+                except Exception as exc:
+                    logger.warning(f"Failed contained-refuge subtraction via union: {exc}")
+                    for cg in contained_geoms:
+                        try:
+                            if result_geom.is_empty:
+                                break
+                            result_geom = _safe_difference(result_geom, cg)
+                        except Exception:
+                            continue
             if existing_geoms:
                 # First, try a fast union-based subtraction
                 try:
