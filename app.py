@@ -139,12 +139,16 @@ def init_data():
 # Allow overriding data directory via environment for persistent disks
 DATA_DIR = os.getenv('DATA_DIR') or os.path.join(os.path.dirname(__file__), 'data')
 REFUGES_FILE = os.path.join(DATA_DIR, 'refuges.json')
+PATHS_FILE = os.path.join(DATA_DIR, 'paths.json')
 
 def _ensure_data_file():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(REFUGES_FILE):
         with open(REFUGES_FILE, 'w', encoding='utf-8') as f:
             json.dump({"refuges": []}, f)
+    if not os.path.exists(PATHS_FILE):
+        with open(PATHS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"paths": []}, f)
 
 def _read_refuges() -> List[Dict[str, Any]]:
     _ensure_data_file()
@@ -178,6 +182,72 @@ def _write_refuges(refuges: List[Dict[str, Any]]):
                 os.remove(tmp_path)
         except Exception:
             pass
+
+
+# -----------------------------
+# Path persistence utilities
+# -----------------------------
+def _read_paths() -> List[Dict[str, Any]]:
+    _ensure_data_file()
+    try:
+        with open(PATHS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            paths = data.get('paths', [])
+            if isinstance(paths, list):
+                return paths
+            return []
+    except Exception as e:
+        logger.error(f"Failed to read paths: {e}")
+        return []
+
+
+def _write_paths(paths: List[Dict[str, Any]]):
+    """Write paths atomically to avoid corruption."""
+    _ensure_data_file()
+    tmp_path = PATHS_FILE + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump({"paths": paths}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, PATHS_FILE)
+    except Exception as e:
+        logger.error(f"Failed to write paths: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+@app.route('/api/paths', methods=['POST'])
+def create_path():
+    try:
+        payload = request.json or {}
+        name = str(payload.get('name', '')).strip()
+        if not name:
+            return jsonify({"status": "error", "message": "Name is required"}), 400
+
+        paths = _read_paths()
+        next_id = 1
+        try:
+            if paths:
+                next_id = max(int(p.get('id', 0) or 0) for p in paths) + 1
+        except Exception:
+            next_id = len(paths) + 1
+
+        new_path = {
+            "id": next_id,
+            "name": name,
+            # Default tuple/list container for future coordinates
+            "points": []
+        }
+        paths.append(new_path)
+        _write_paths(paths)
+        return jsonify({"status": "success", "path": new_path}), 201
+    except Exception as e:
+        logger.error(f"Failed to create path: {e}")
+        return jsonify({"status": "error", "message": "Failed to create path"}), 500
 
 
 def _make_valid_polygonal(geom: BaseGeometry) -> BaseGeometry:
