@@ -220,6 +220,16 @@ def _write_paths(paths: List[Dict[str, Any]]):
             pass
 
 
+@app.route('/api/paths', methods=['GET'])
+def list_paths():
+    try:
+        paths = _read_paths()
+        return jsonify({"status": "success", "paths": paths})
+    except Exception as e:
+        logger.error(f"Failed to list paths: {e}")
+        return jsonify({"status": "error", "message": "Failed to list paths"}), 500
+
+
 @app.route('/api/paths', methods=['POST'])
 def create_path():
     try:
@@ -240,7 +250,11 @@ def create_path():
             "id": next_id,
             "name": name,
             # Default tuple/list container for future coordinates
-            "points": []
+            "points": [],
+            # Inline markers (legacy field)
+            "markers": [],
+            # Popup posts keyed by point index: { "<i>": {caption,image_url,lat,lng,point_index} }
+            "pathname_pups": {}
         }
         paths.append(new_path)
         _write_paths(paths)
@@ -248,6 +262,88 @@ def create_path():
     except Exception as e:
         logger.error(f"Failed to create path: {e}")
         return jsonify({"status": "error", "message": "Failed to create path"}), 500
+
+
+@app.route('/api/paths/<int:path_id>', methods=['PUT'])
+def update_path(path_id: int):
+    try:
+        payload = request.json or {}
+        name = str(payload.get('name', '')).strip()
+        if not name:
+            return jsonify({"status": "error", "message": "Name is required"}), 400
+
+        points = payload.get('points', [])
+        markers = payload.get('markers', [])
+        pathname_pups = payload.get('pathname_pups', {})
+        if points is None:
+            points = []
+        if markers is None:
+            markers = []
+        if not isinstance(pathname_pups, dict):
+            pathname_pups = {}
+
+        paths = _read_paths()
+        updated = False
+        for p in paths:
+            if int(p.get('id', 0) or 0) == path_id:
+                p['name'] = name
+                p['points'] = points
+                p['markers'] = markers
+                p['pathname_pups'] = pathname_pups
+                updated = True
+                break
+
+        if not updated:
+            return jsonify({"status": "error", "message": "Path not found"}), 404
+
+        _write_paths(paths)
+        return jsonify({"status": "success", "path": next((p for p in paths if int(p.get('id', 0) or 0) == path_id), None)})
+    except Exception as e:
+        logger.error(f"Failed to update path {path_id}: {e}")
+        return jsonify({"status": "error", "message": "Failed to update path"}), 500
+
+
+@app.route('/api/paths/<int:path_id>/popups', methods=['POST'])
+def add_path_popup(path_id: int):
+    try:
+        payload = request.json or {}
+        caption = str(payload.get('caption', '')).strip()
+        image_url = str(payload.get('image_url', '')).strip()
+        point_index = payload.get('point_index')
+        lat = payload.get('lat')
+        lng = payload.get('lng')
+
+        if not caption and not image_url:
+            return jsonify({"status": "error", "message": "Caption or image required"}), 400
+
+        paths = _read_paths()
+        target = None
+        for p in paths:
+            if int(p.get('id', 0) or 0) == path_id:
+                target = p
+                break
+
+        if target is None:
+            return jsonify({"status": "error", "message": "Path not found"}), 404
+
+        pups = target.get('pathname_pups')
+        if not isinstance(pups, dict):
+            pups = {}
+
+        key = str(point_index) if point_index is not None else ''
+        pups[key] = {
+            "caption": caption,
+            "image_url": image_url,
+            "point_index": point_index,
+            "lat": lat,
+            "lng": lng
+        }
+        target['pathname_pups'] = pups
+        _write_paths(paths)
+        return jsonify({"status": "success", "popup": pups.get(key), "path": target}), 201
+    except Exception as e:
+        logger.error(f"Failed to add popup to path {path_id}: {e}")
+        return jsonify({"status": "error", "message": "Failed to add popup"}), 500
 
 
 def _make_valid_polygonal(geom: BaseGeometry) -> BaseGeometry:
