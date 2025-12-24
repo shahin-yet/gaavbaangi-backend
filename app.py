@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 from typing import List, Dict, Any
 from shapely.geometry import shape as shapely_shape, mapping as shapely_mapping
 from shapely.geometry.base import BaseGeometry
-from shapely.geometry import Polygon as ShpPolygon, MultiPolygon as ShpMultiPolygon
+from shapely.geometry import Polygon as ShpPolygon, MultiPolygon as ShpMultiPolygon, Point as ShpPoint
 from shapely.ops import unary_union
 
 # Configure logging
@@ -220,11 +220,87 @@ def _write_paths(paths: List[Dict[str, Any]]):
             pass
 
 
+def _coerce_float(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_refuge_containing_point(lat: float | None, lng: float | None):
+    """Return the first refuge whose polygon covers the given lat/lng."""
+    lat_val = _coerce_float(lat)
+    lng_val = _coerce_float(lng)
+    if lat_val is None or lng_val is None:
+        return None
+
+    try:
+        pt = ShpPoint(lng_val, lat_val)
+    except Exception:
+        return None
+
+    refuges = _read_refuges()
+    for refuge in refuges:
+        poly = refuge.get('polygon')
+        if not poly or not isinstance(poly, dict):
+            continue
+        try:
+            geom = _make_valid_polygonal(shapely_shape(poly))
+        except Exception:
+            continue
+        try:
+            if geom.is_empty:
+                continue
+            if geom.covers(pt) or geom.contains(pt):
+                return refuge
+        except Exception:
+            try:
+                buffered = geom.buffer(0)
+                if buffered.covers(pt):
+                    return refuge
+            except Exception:
+                continue
+    return None
+
+
+def _group_paths_by_refuge(paths: List[Dict[str, Any]], refuges: List[Dict[str, Any]]):
+    """Group paths by refuge using a set of path names for quick lookup."""
+    id_index = {r.get('id'): r for r in refuges if isinstance(r.get('id'), int)}
+    name_index = {(r.get('name') or '').strip().lower(): r for r in refuges if isinstance(r.get('name'), str)}
+    grouped = {}
+
+    for p in paths:
+        rid = p.get('refuge_id')
+        rname = (p.get('refuge_name') or '').strip()
+        if rid is None and rname:
+            match = name_index.get(rname.lower())
+            if match:
+                rid = match.get('id')
+        if rid is None:
+            continue
+        key = str(rid)
+        entry = grouped.setdefault(key, {
+            "refuge_id": rid,
+            "refuge_name": id_index.get(rid, {}).get('name') or rname,
+            "path_names": set()
+        })
+        name_val = (p.get('name') or '').strip()
+        if name_val:
+            entry["path_names"].add(name_val)
+
+    # Convert sets to sorted lists for JSON serialization
+    for entry in grouped.values():
+        entry["path_names"] = sorted(entry["path_names"])
+    return list(grouped.values())
+
+
 @app.route('/api/paths', methods=['GET'])
 def list_paths():
     try:
         paths = _read_paths()
-        return jsonify({"status": "success", "paths": paths})
+        refuges = _read_refuges()
+        grouped = _group_paths_by_refuge(paths, refuges)
+        return jsonify({"status": "success", "paths": paths, "paths_by_refuge": grouped})
     except Exception as e:
         logger.error(f"Failed to list paths: {e}")
         return jsonify({"status": "error", "message": "Failed to list paths"}), 500
@@ -254,7 +330,10 @@ def create_path():
             # Inline markers (legacy field)
             "markers": [],
             # Popup posts keyed by point index: { "<i>": {caption,image_url,lat,lng,point_index} }
-            "pathname_pups": {}
+            "pathname_pups": {},
+            # Refuge association for quick grouping/search
+            "refuge_id": None,
+            "refuge_name": None
         }
         paths.append(new_path)
         _write_paths(paths)
@@ -282,6 +361,19 @@ def update_path(path_id: int):
         if not isinstance(pathname_pups, dict):
             pathname_pups = {}
 
+        if not isinstance(points, list) or not points:
+            return jsonify({"status": "error", "message": "Path must include at least one point"}), 400
+
+        end_point = points[-1] if isinstance(points[-1], dict) else {}
+        end_lat = _coerce_float(end_point.get('lat') if isinstance(end_point, dict) else None)
+        end_lng = _coerce_float(end_point.get('lng') if isinstance(end_point, dict) else None)
+        if end_lat is None or end_lng is None:
+            return jsonify({"status": "error", "message": "Endpoint coordinates are missing"}), 400
+
+        matched_refuge = _find_refuge_containing_point(end_lat, end_lng)
+        if not matched_refuge:
+            return jsonify({"status": "error", "message": "Path endpoint must be inside a refuge area"}), 400
+
         paths = _read_paths()
         updated = False
         for p in paths:
@@ -290,6 +382,8 @@ def update_path(path_id: int):
                 p['points'] = points
                 p['markers'] = markers
                 p['pathname_pups'] = pathname_pups
+                p['refuge_id'] = matched_refuge.get('id')
+                p['refuge_name'] = matched_refuge.get('name')
                 updated = True
                 break
 
@@ -326,17 +420,72 @@ def add_path_popup(path_id: int):
         if target is None:
             return jsonify({"status": "error", "message": "Path not found"}), 404
 
+        points = target.get('points')
+        if not isinstance(points, list) or not points:
+            return jsonify({"status": "error", "message": "Path has no points to attach popup"}), 400
+
+        def _coerce_float(val):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        def _nearest_point_idx(points_list, ref_lat, ref_lng):
+            if ref_lat is None or ref_lng is None:
+                return None
+            best_idx = None
+            best_dist = None
+            for idx, pt in enumerate(points_list):
+                if not isinstance(pt, dict):
+                    continue
+                p_lat = _coerce_float(pt.get('lat'))
+                p_lng = _coerce_float(pt.get('lng'))
+                if p_lat is None or p_lng is None:
+                    continue
+                dist = (p_lat - ref_lat) ** 2 + (p_lng - ref_lng) ** 2
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            return best_idx
+
+        lat_val = _coerce_float(lat)
+        lng_val = _coerce_float(lng)
+
+        idx_val = None
+        try:
+            candidate_idx = int(point_index)
+            if 0 <= candidate_idx < len(points):
+                idx_val = candidate_idx
+        except (TypeError, ValueError):
+            idx_val = None
+
+        if idx_val is None:
+            idx_val = _nearest_point_idx(points, lat_val, lng_val)
+
+        if idx_val is None:
+            return jsonify({"status": "error", "message": "Unable to attach popup to a path point"}), 400
+
+        attach_point = points[idx_val] if 0 <= idx_val < len(points) else {}
+        attach_lat = _coerce_float(attach_point.get('lat') if isinstance(attach_point, dict) else None)
+        attach_lng = _coerce_float(attach_point.get('lng') if isinstance(attach_point, dict) else None)
+        if attach_lat is None or attach_lng is None:
+            attach_lat = lat_val
+            attach_lng = lng_val
+
+        if attach_lat is None or attach_lng is None:
+            return jsonify({"status": "error", "message": "Popup location is missing coordinates"}), 400
+
         pups = target.get('pathname_pups')
         if not isinstance(pups, dict):
             pups = {}
 
-        key = str(point_index) if point_index is not None else ''
+        key = str(idx_val)
         pups[key] = {
             "caption": caption,
             "image_url": image_url,
-            "point_index": point_index,
-            "lat": lat,
-            "lng": lng
+            "point_index": idx_val,
+            "lat": attach_lat,
+            "lng": attach_lng
         }
         target['pathname_pups'] = pups
         _write_paths(paths)
